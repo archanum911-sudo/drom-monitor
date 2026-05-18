@@ -10,24 +10,30 @@ from bs4 import BeautifulSoup
 import re
 import json
 import os
+import sys
 import smtplib
 import time
+import argparse
 from datetime import datetime
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-from typing import List, Dict, Tuple, Set, Optional
+from typing import List, Dict, Tuple, Optional
 
 # ============ КОНФИГУРАЦИЯ ============
-# НОВЫЙ URL Дрома — профиль Anikuya (замена aniku123)
 BASE_DROM = "https://vladivostok.baza.drom.ru/user/Anikuya/wheel/disc/"
-# НОВЫЙ URL сайта — fulllist (замена catalog/diski)
 SITE_URL = "https://aniku.ru/fulllist"
 
-EMAIL_FROM = os.getenv("EMAIL_FROM", "")
-EMAIL_PASS = os.getenv("EMAIL_PASS", "")
-EMAIL_TO = os.getenv("EMAIL_TO", "palkinns@mail.ru")
-
 SNAPSHOT_FILE = "snapshot.json"
+
+# Поддерживаем оба формата секретов: SMTP_USER/SMTP_PASS и EMAIL_FROM/EMAIL_PASS
+EMAIL_FROM = os.getenv("SMTP_USER") or os.getenv("EMAIL_FROM") or ""
+EMAIL_PASS = os.getenv("SMTP_PASS") or os.getenv("EMAIL_PASS") or ""
+
+# Парсим аргумент --email или берём из env EMAIL_TO
+parser = argparse.ArgumentParser()
+parser.add_argument("--email", default=os.getenv("EMAIL_TO", "palkinns@mail.ru"))
+args, _ = parser.parse_known_args()
+EMAIL_TO = args.email
 
 HEADERS_DROM = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -60,7 +66,6 @@ def fetch_all_drom() -> List[Dict]:
     session = requests.Session()
     session.headers.update(HEADERS_DROM)
 
-    # Прогрев — заходим на базовую страницу для получения cookies
     try:
         session.get("https://baza.drom.ru/", timeout=30)
         time.sleep(1)
@@ -82,7 +87,6 @@ def fetch_all_drom() -> List[Dict]:
             resp.raise_for_status()
             soup = BeautifulSoup(resp.text, "lxml")
             
-            # Проверяем не капча ли
             if "робот" in resp.text.lower() or "капч" in resp.text.lower():
                 print(f"[ERROR] Дром выдал капчу на стр. {page}")
                 break
@@ -126,7 +130,6 @@ def parse_drom_page(soup: BeautifulSoup) -> List[Dict]:
             loc_el = row.select_one(".bull-item__field__location")
             location = loc_el.get_text(strip=True) if loc_el else ""
 
-            # Попытка найти количество
             qty = 1
             qty_patterns = [
                 row.select_one(".bull-item__field__setQuantity"),
@@ -166,7 +169,6 @@ def fetch_site() -> List[Dict]:
             resp.raise_for_status()
             soup = BeautifulSoup(resp.text, "lxml")
             
-            # Проверяем не капча ли
             if "робот" in resp.text.lower() or "капч" in resp.text.lower():
                 print(f"[ERROR] Сайт выдал капчу на стр. {page}")
                 break
@@ -177,7 +179,6 @@ def fetch_site() -> List[Dict]:
             all_items.extend(items)
             print(f"[Сайт] Стр. {page}: +{len(items)} (всего {len(all_items)})")
 
-            # Проверяем наличие следующей страницы
             next_link = soup.select_one("a.next, a[rel='next']")
             if not next_link:
                 pagination = soup.select(".pagination a, .paging a")
@@ -194,22 +195,16 @@ def fetch_site() -> List[Dict]:
 def parse_site_page(soup: BeautifulSoup) -> List[Dict]:
     """Парсит одну страницу каталога aniku.ru"""
     items = []
-    
-    # Новая структура aniku.ru/fulllist
     products = soup.select("div.product-item, li.product, .product")
     
-    # Fallback: ищем по ссылкам с id (структура fulllist)
     if not products:
         products = soup.select("a[href*='fulllist?id=']")
     
     for prod in products:
         try:
-            # Вариант 1: стандартная структура
             name_el = prod.select_one(".product-name a, h3 a, a.name, .product-title a")
             if not name_el:
-                # Вариант 2: ссылка сама по себе (fulllist)
                 name_el = prod if prod.name == 'a' else None
-            
             if not name_el:
                 continue
                 
@@ -217,16 +212,13 @@ def parse_site_page(soup: BeautifulSoup) -> List[Dict]:
             if not name:
                 continue
             
-            # Извлекаем цену
             price = 0
             price_container = prod.select_one(".price, .product-price, .current-price")
             if price_container:
                 price_raw = price_container.get_text(strip=True)
                 price = int(re.sub(r'[^\d]', '', price_raw)) if re.sub(r'[^\d]', '', price_raw) else 0
             
-            # Количество
             qty = 1
-            
             article = extract_article(name)
             href = name_el.get("href", "") if hasattr(name_el, 'get') else ""
             
@@ -246,12 +238,6 @@ def parse_site_page(soup: BeautifulSoup) -> List[Dict]:
 
 # ============ ОБЪЕДИНЕНИЕ И СРАВНЕНИЕ ============
 def merge_by_article(drom_items: List[Dict], site_items: List[Dict]) -> Tuple[Dict, Dict, Dict]:
-    """
-    Объединяет по артикулу. Возвращает:
-    - merged: артикул → {drom, site}
-    - only_site: артикул → site_item
-    - only_drom: артикул → drom_item
-    """
     drom_by_art: Dict[str, Dict] = {}
     site_by_art: Dict[str, Dict] = {}
 
@@ -270,10 +256,7 @@ def merge_by_article(drom_items: List[Dict], site_items: List[Dict]) -> Tuple[Di
     only_drom = {}
 
     for art in set(drom_by_art.keys()) & set(site_by_art.keys()):
-        merged[art] = {
-            "drom": drom_by_art[art],
-            "site": site_by_art[art],
-        }
+        merged[art] = {"drom": drom_by_art[art], "site": site_by_art[art]}
 
     for art in set(site_by_art.keys()) - set(drom_by_art.keys()):
         only_site[art] = site_by_art[art]
@@ -284,7 +267,6 @@ def merge_by_article(drom_items: List[Dict], site_items: List[Dict]) -> Tuple[Di
     return merged, only_site, only_drom
 
 def compare_with_previous(current_items: List[Dict]) -> List[str]:
-    """Сравнивает с предыдущим снапшотом, возвращает список изменений"""
     alerts = []
     if not os.path.exists(SNAPSHOT_FILE):
         return alerts
@@ -293,22 +275,19 @@ def compare_with_previous(current_items: List[Dict]) -> List[str]:
         with open(SNAPSHOT_FILE, "r", encoding="utf-8") as f:
             previous = json.load(f)
     except Exception as e:
-        print(f"[WARN] Не удалось загрузить предыдущий снапшот: {e}")
+        print(f"[WARN] Не удалось загрузить снапшот: {e}")
         return alerts
 
-    # Защита от старого формата (list или неправильная структура)
     if isinstance(previous, list):
-        print("[WARN] Старый формат снапшота (list), пропускаем сравнение")
+        print("[WARN] Старый формат снапшота (list), пропускаем")
         return alerts
     
-    # Проверяем что значения — dict
     if not all(isinstance(v, dict) for v in previous.values()):
-        print("[WARN] Некорректный формат снапшота, пропускаем сравнение")
+        print("[WARN] Некорректный формат снапшота, пропускаем")
         return alerts
 
     current_dict = {item["article"]: item for item in current_items if item.get("article")}
 
-    # Проверяем изменения цен и наличия
     for art, prev_data in previous.items():
         if art in current_dict:
             curr = current_dict[art]
@@ -329,7 +308,6 @@ def compare_with_previous(current_items: List[Dict]) -> List[str]:
 
 # ============ ФОРМИРОВАНИЕ ОТЧЁТА ============
 def build_html_report(merged: Dict, only_site: Dict, only_drom: Dict, alerts: List[str]) -> str:
-    """Формирует единый HTML-отчёт без дублей"""
     now = datetime.now().strftime("%d.%m.%Y %H:%M")
     total = len(merged) + len(only_site) + len(only_drom)
 
@@ -448,7 +426,6 @@ def build_html_report(merged: Dict, only_site: Dict, only_drom: Dict, alerts: Li
     return html
 
 def save_snapshot(items: List[Dict]):
-    """Сохраняет снапшот текущих данных для сравнения в будущем"""
     snap = {}
     for item in items:
         art = item.get("article")
@@ -464,9 +441,10 @@ def save_snapshot(items: List[Dict]):
 
 # ============ ОТПРАВКА EMAIL ============
 def send_email(subject: str, html_body: str) -> bool:
-    """Отправляет HTML-письмо через SMTP Mail.ru"""
+    print(f"[DEBUG] EMAIL_FROM={EMAIL_FROM[:3]}... | EMAIL_TO={EMAIL_TO} | PASS={'*' if EMAIL_PASS else 'EMPTY'}")
+    
     if not EMAIL_FROM or not EMAIL_PASS:
-        print("[SKIP] Email не настроен (отсутствуют EMAIL_FROM / EMAIL_PASS)")
+        print("[SKIP] Email не настроен: отсутствует логин или пароль")
         return False
 
     try:
@@ -489,24 +467,21 @@ def send_email(subject: str, html_body: str) -> bool:
 # ============ ГЛАВНЫЙ ПРОЦЕСС ============
 def main():
     print(f"\n{'='*50}")
-    print(f"🚀 Запуск мониторинга — {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}")
+    print(f"🚀 Запуск — {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}")
+    print(f"EMAIL_FROM={'SET' if EMAIL_FROM else 'EMPTY'} | EMAIL_TO={EMAIL_TO} | EMAIL_PASS={'SET' if EMAIL_PASS else 'EMPTY'}")
     print(f"{'='*50}\n")
 
-    # 1. Парсим Дром
     print("[1/4] Парсинг Дрома...")
     drom_items = fetch_all_drom()
     print(f"✅ Дром: {len(drom_items)} позиций")
 
-    # 2. Парсим сайт
     print("\n[2/4] Парсинг aniku.ru...")
     site_items = fetch_site()
     print(f"✅ Сайт: {len(site_items)} позиций")
 
-    # 3. Объединяем по артикулам
     print("\n[3/4] Объединение по артикулам...")
     merged, only_site, only_drom = merge_by_article(drom_items, site_items)
 
-    # Собираем единый список для снапшота и сравнения
     unified_items = []
     for art, data in merged.items():
         unified_items.append({
@@ -530,19 +505,15 @@ def main():
             "quantity": item.get("quantity", 1),
         })
 
-    # 4. Сравнение с предыдущим запуском
     alerts = compare_with_previous(unified_items)
 
-    # 5. Формируем отчёт
-    print("\n[4/4] Формирование отчёта...")
+    print("\n[4/4] Формирование и отправка отчёта...")
     html_report = build_html_report(merged, only_site, only_drom, alerts)
 
-    # 6. Отправляем email
     now_str = datetime.now().strftime("%d.%m.%Y")
     subject = f"📊 Анику — остатки {now_str} | Уникальных: {len(unified_items)}"
     send_email(subject, html_report)
 
-    # 7. Сохраняем снапшот
     save_snapshot(unified_items)
 
     print(f"\n{'='*50}")
