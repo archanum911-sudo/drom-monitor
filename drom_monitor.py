@@ -331,7 +331,8 @@ def save_snapshot(data: Dict):
         print(f"[WARN] Сохранена упрощенная версия снапшота")
 
 
-def compare_with_previous(current: Dict, previous: Dict) -> Dict:
+def compare_with_previous(current: Dict, previous) -> Dict:
+    """Сравнивает текущее состояние с предыдущим. Возвращает статистику изменений."""
     stats = {
         "drom_total": current.get("drom_total", 0),
         "site_total": current.get("site_total", 0),
@@ -340,7 +341,10 @@ def compare_with_previous(current: Dict, previous: Dict) -> Dict:
         "only_drom": len(current.get("only_drom", {})),
     }
 
-    if not previous:
+    # Если previous — старый формат (list) или None — пропускаем сравнение
+    if not previous or isinstance(previous, list):
+        if isinstance(previous, list):
+            print("[WARN] Обнаружен старый формат снапшота (list). Сравнение пропущено. Следующий запуск будет сравнивать корректно.")
         return stats
 
     prev_merged = previous.get("merged", {})
