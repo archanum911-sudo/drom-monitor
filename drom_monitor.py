@@ -4,6 +4,7 @@
 Анику — Единый мониторинг (Дром + сайт aniku.ru)
 
 Парсит оба источника, сопоставляет по артикулам, формирует единый отчет.
+Каждый артикул в одном экземпляре, без дублей.
 """
 
 import argparse
@@ -344,7 +345,7 @@ def compare_with_previous(current: Dict, previous) -> Dict:
     # Если previous — старый формат (list) или None — пропускаем сравнение
     if not previous or isinstance(previous, list):
         if isinstance(previous, list):
-            print("[WARN] Обнаружен старый формат снапшота (list). Сравнение пропущено. Следующий запуск будет сравнивать корректно.")
+            print("[WARN] Обнаружен старый формат снапшота (list). Сравнение пропущено.")
         return stats
 
     prev_merged = previous.get("merged", {})
@@ -381,7 +382,7 @@ def compare_with_previous(current: Dict, previous) -> Dict:
     return stats
 
 
-# ==================== ОТЧЕТ ====================
+# ==================== ОТЧЕТ (единая таблица без дублей) ====================
 
 def build_html_report(current: Dict, stats: Dict) -> str:
     date_str = datetime.now().strftime("%d.%m.%Y %H:%M")
@@ -389,129 +390,144 @@ def build_html_report(current: Dict, stats: Dict) -> str:
     only_site = current.get("only_site", {})
     only_drom = current.get("only_drom", {})
 
+    # Собираем все артикулы в единый список (без дублей)
+    all_items = []
+
+    # 1. Дубли — одна строка
+    for art, data in merged.items():
+        all_items.append({
+            "article": art,
+            "brand": data["brand"],
+            "diameter": data.get("diameter"),
+            "title": data["title_site"],
+            "price_site": data["price_site"],
+            "price_drom": data["price_drom"],
+            "href_site": data["href_site"],
+            "href_drom": data["href_drom"],
+            "status": "Оба",
+            "status_icon": "🟢",
+            "status_color": "#2e7d32",
+        })
+
+    # 2. Только на сайте
+    for art, item in only_site.items():
+        all_items.append({
+            "article": art,
+            "brand": item["brand"],
+            "diameter": item.get("diameter"),
+            "title": item["title"],
+            "price_site": item["price"],
+            "price_drom": None,
+            "href_site": item["href"],
+            "href_drom": None,
+            "status": "Только сайт",
+            "status_icon": "🟡",
+            "status_color": "#ed6c00",
+        })
+
+    # 3. Только на Дроме
+    for art, item in only_drom.items():
+        all_items.append({
+            "article": art,
+            "brand": item["brand"],
+            "diameter": item.get("diameter"),
+            "title": item["title"],
+            "price_site": None,
+            "price_drom": item["price"],
+            "href_site": None,
+            "href_drom": item["href"],
+            "status": "Только Дром",
+            "status_icon": "🔴",
+            "status_color": "#c62828",
+        })
+
+    # Сортируем: Только сайт → Оба → Только Дром, затем по цене
+    status_order = {"Только сайт": 0, "Оба": 1, "Только Дром": 2}
+    all_items.sort(key=lambda x: (status_order[x["status"]], -(x["price_site"] or x["price_drom"] or 0)))
+
+    # Карточки статистики
     cards = f"""
     <div style="display:flex;gap:10px;margin:20px 0;flex-wrap:wrap;">
-        <div style="background:#e3f2fd;padding:14px;border-radius:6px;text-align:center;min-width:95px;">
+        <div style="background:#e3f2fd;padding:14px;border-radius:6px;text-align:center;min-width:90px;">
             <div style="font-size:20px;font-weight:bold;color:#1565c0;">{stats['drom_total']}</div>
             <div style="font-size:11px;color:#666;">{SOURCE_DROM}</div>
         </div>
-        <div style="background:#e8f5e9;padding:14px;border-radius:6px;text-align:center;min-width:95px;">
+        <div style="background:#e8f5e9;padding:14px;border-radius:6px;text-align:center;min-width:90px;">
             <div style="font-size:20px;font-weight:bold;color:#2e7d32;">{stats['site_total']}</div>
             <div style="font-size:11px;color:#666;">{SOURCE_SITE}</div>
         </div>
-        <div style="background:#f3e5f5;padding:14px;border-radius:6px;text-align:center;min-width:95px;">
-            <div style="font-size:20px;font-weight:bold;color:#6a1b9a;">{stats['merged']}</div>
-            <div style="font-size:11px;color:#666;">Дублей</div>
+        <div style="background:#f3e5f5;padding:14px;border-radius:6px;text-align:center;min-width:90px;">
+            <div style="font-size:20px;font-weight:bold;color:#6a1b9a;">{len(all_items)}</div>
+            <div style="font-size:11px;color:#666;">Уникальных арт.</div>
         </div>
-        <div style="background:#fff3e0;padding:14px;border-radius:6px;text-align:center;min-width:95px;">
-            <div style="font-size:20px;font-weight:bold;color:#ef6c00;">{stats['only_site']}</div>
-            <div style="font-size:11px;color:#666;">Только на сайте</div>
+        <div style="background:#e0f2f1;padding:14px;border-radius:6px;text-align:center;min-width:90px;">
+            <div style="font-size:20px;font-weight:bold;color:#00695c;">{stats['merged']}</div>
+            <div style="font-size:11px;color:#666;">🟢 Оба</div>
         </div>
-        <div style="background:#ffebee;padding:14px;border-radius:6px;text-align:center;min-width:95px;">
+        <div style="background:#fff3e0;padding:14px;border-radius:6px;text-align:center;min-width:90px;">
+            <div style="font-size:20px;font-weight:bold;color:#ed6c00;">{stats['only_site']}</div>
+            <div style="font-size:11px;color:#666;">🟡 Только сайт</div>
+        </div>
+        <div style="background:#ffebee;padding:14px;border-radius:6px;text-align:center;min-width:90px;">
             <div style="font-size:20px;font-weight:bold;color:#c62828;">{stats['only_drom']}</div>
-            <div style="font-size:11px;color:#666;">Только на Дроме</div>
+            <div style="font-size:11px;color:#666;">🔴 Только Дром</div>
         </div>
     </div>"""
 
-    # Блок: Только на aniku.ru
-    only_site_section = ""
-    if only_site:
-        rows = ""
-        for art, item in sorted(only_site.items(), key=lambda x: x[1]["price"], reverse=True)[:30]:
-            rows += f"""
-            <tr>
-                <td style="padding:8px;border-bottom:1px solid #eee;font-family:monospace;font-size:12px;">{art}</td>
-                <td style="padding:8px;border-bottom:1px solid #eee;">{item['brand']}</td>
-                <td style="padding:8px;border-bottom:1px solid #eee;"><a href="{item['href']}">{item['title'][:55]}</a></td>
-                <td style="padding:8px;border-bottom:1px solid #eee;text-align:center;">R{item.get('diameter', '?')}</td>
-                <td style="padding:8px;border-bottom:1px solid #eee;text-align:right;font-weight:bold;color:#2e7d32;">{item['price']:,.0f} ₽</td>
-            </tr>"""
-        only_site_section = f"""
-        <h3 style="color:#2e7d32;margin-top:25px;">✅ Только на {SOURCE_SITE} — нужно выложить ({len(only_site)})</h3>
-        <table style="width:100%;border-collapse:collapse;font-size:12px;">
-            <thead><tr style="background:#f5f5f5;">
-                <th style="padding:8px;text-align:left;width:70px;">Арт.</th>
-                <th style="padding:8px;text-align:left;">Бренд</th>
-                <th style="padding:8px;text-align:left;">Название</th>
-                <th style="padding:8px;text-align:center;">R</th>
-                <th style="padding:8px;text-align:right;">Цена</th>
-            </tr></thead>
-            <tbody>{rows}</tbody>
-        </table>
-        <p style="color:#666;font-size:11px;">Показано топ-30 по цене. Всего {len(only_site)} позиций.</p>"""
+    # Единая таблица всех артикулов
+    rows = ""
+    for item in all_items:
+        ps = f"{item['price_site']:,.0f} ₽" if item['price_site'] else "—"
+        pd = f"{item['price_drom']:,.0f} ₽" if item['price_drom'] else "—"
+        d = f"R{item['diameter']}" if item['diameter'] else "—"
+        title_link = item['title'][:50]
+        if item['href_site']:
+            title_link = f'<a href="{item["href_site"]}">{title_link}</a>'
+        elif item['href_drom']:
+            title_link = f'<a href="{item["href_drom"]}">{title_link}</a>'
 
-    # Блок: Только на Дроме
-    only_drom_section = ""
-    if only_drom:
-        rows = ""
-        for art, item in sorted(only_drom.items(), key=lambda x: x[1]["price"], reverse=True):
-            rows += f"""
-            <tr>
-                <td style="padding:8px;border-bottom:1px solid #eee;font-family:monospace;font-size:12px;">{art}</td>
-                <td style="padding:8px;border-bottom:1px solid #eee;">{item['brand']}</td>
-                <td style="padding:8px;border-bottom:1px solid #eee;"><a href="{item['href']}">{item['title'][:55]}</a></td>
-                <td style="padding:8px;border-bottom:1px solid #eee;text-align:center;">R{item.get('diameter', '?')}</td>
-                <td style="padding:8px;border-bottom:1px solid #eee;text-align:right;">{item['price']:,.0f} ₽</td>
-            </tr>"""
-        only_drom_section = f"""
-        <h3 style="color:#c62828;margin-top:25px;">⚠️ Только на {SOURCE_DROM} — возможно устарело ({len(only_drom)})</h3>
-        <table style="width:100%;border-collapse:collapse;font-size:12px;">
-            <thead><tr style="background:#f5f5f5;">
-                <th style="padding:8px;text-align:left;width:70px;">Арт.</th>
-                <th style="padding:8px;text-align:left;">Бренд</th>
-                <th style="padding:8px;text-align:left;">Название</th>
-                <th style="padding:8px;text-align:center;">R</th>
-                <th style="padding:8px;text-align:right;">Цена</th>
-            </tr></thead>
-            <tbody>{rows}</tbody>
-        </table>"""
+        bg = {"Только сайт": "#fff8e1", "Оба": "", "Только Дром": "#ffebee"}[item["status"]]
 
-    # Блок: Дубли с разницей цен
-    merged_section = ""
-    if merged:
-        diff_items = []
-        for art, data in merged.items():
-            pdrom = data.get("price_drom", 0) or 0
-            psite = data.get("price_site", 0) or 0
-            if pdrom != psite:
-                diff_items.append((art, data, psite - pdrom))
+        rows += f"""
+        <tr style="background:{bg};">
+            <td style="padding:8px;border-bottom:1px solid #eee;font-family:monospace;font-size:12px;font-weight:bold;">{item['article']}</td>
+            <td style="padding:8px;border-bottom:1px solid #eee;text-align:center;font-size:16px;">{item['status_icon']}</td>
+            <td style="padding:8px;border-bottom:1px solid #eee;color:{item['status_color']};font-size:11px;font-weight:bold;">{item['status']}</td>
+            <td style="padding:8px;border-bottom:1px solid #eee;">{item['brand']}</td>
+            <td style="padding:8px;border-bottom:1px solid #eee;">{title_link}</td>
+            <td style="padding:8px;border-bottom:1px solid #eee;text-align:center;">{d}</td>
+            <td style="padding:8px;border-bottom:1px solid #eee;text-align:right;">{ps}</td>
+            <td style="padding:8px;border-bottom:1px solid #eee;text-align:right;">{pd}</td>
+        </tr>"""
 
-        if diff_items:
-            diff_items.sort(key=lambda x: abs(x[2]), reverse=True)
-            rows = ""
-            for art, data, delta in diff_items[:20]:
-                color = "#c62828" if delta < 0 else "#2e7d32" if delta > 0 else "#666"
-                arrow = "▼" if delta < 0 else "▲" if delta > 0 else "="
-                rows += f"""
-                <tr>
-                    <td style="padding:8px;border-bottom:1px solid #eee;font-family:monospace;font-size:12px;">{art}</td>
-                    <td style="padding:8px;border-bottom:1px solid #eee;">{data['brand']}</td>
-                    <td style="padding:8px;border-bottom:1px solid #eee;">{data['title_site'][:45]}</td>
-                    <td style="padding:8px;border-bottom:1px solid #eee;text-align:right;">{data['price_site']:,.0f} ₽</td>
-                    <td style="padding:8px;border-bottom:1px solid #eee;text-align:right;">{data['price_drom']:,.0f} ₽</td>
-                    <td style="padding:8px;border-bottom:1px solid #eee;text-align:right;color:{color};font-weight:bold;">{arrow} {abs(delta):,.0f}</td>
-                </tr>"""
-            merged_section = f"""
-            <h3 style="color:#1565c0;margin-top:25px;">🔀 Дубли с разницей цен (топ-20 из {len(diff_items)})</h3>
-            <table style="width:100%;border-collapse:collapse;font-size:12px;">
-                <thead><tr style="background:#f5f5f5;">
-                    <th style="padding:8px;text-align:left;width:70px;">Арт.</th>
-                    <th style="padding:8px;text-align:left;">Бренд</th>
-                    <th style="padding:8px;text-align:left;">Название</th>
-                    <th style="padding:8px;text-align:right;">{SOURCE_SITE}</th>
-                    <th style="padding:8px;text-align:right;">{SOURCE_DROM}</th>
-                    <th style="padding:8px;text-align:right;">Δ</th>
-                </tr></thead>
-                <tbody>{rows}</tbody>
-            </table>"""
+    full_table = f"""
+    <h3 style="color:#333;margin-top:25px;">📋 Полный каталог артикулов Анику ({len(all_items)} шт.)</h3>
+    <p style="color:#666;font-size:12px;margin-bottom:10px;">
+        🟢 Оба источника | 🟡 Только aniku.ru (стоит выложить на Дром) | 🔴 Только Дром (проверить)
+    </p>
+    <div style="overflow-x:auto;">
+    <table style="width:100%;border-collapse:collapse;font-size:12px;min-width:800px;">
+        <thead><tr style="background:#f5f5f5;">
+            <th style="padding:10px;text-align:left;width:70px;">Арт.</th>
+            <th style="padding:10px;text-align:center;width:30px;"></th>
+            <th style="padding:10px;text-align:left;width:90px;">Статус</th>
+            <th style="padding:10px;text-align:left;">Бренд</th>
+            <th style="padding:10px;text-align:left;">Название</th>
+            <th style="padding:10px;text-align:center;">R</th>
+            <th style="padding:10px;text-align:right;">aniku.ru</th>
+            <th style="padding:10px;text-align:right;">Дром</th>
+        </tr></thead>
+        <tbody>{rows}</tbody>
+    </table>
+    </div>"""
 
     # Блок: Изменения цен
     price_change_section = ""
     price_changes = stats.get("price_changes", [])
     if price_changes:
-        rows = ""
+        pc_rows = ""
         for pc in price_changes[:15]:
-            rows += f"""
+            pc_rows += f"""
             <tr>
                 <td style="padding:8px;border-bottom:1px solid #eee;font-family:monospace;font-size:12px;">{pc['article']}</td>
                 <td style="padding:8px;border-bottom:1px solid #eee;">{pc['brand']}</td>
@@ -529,21 +545,19 @@ def build_html_report(current: Dict, stats: Dict) -> str:
                 <th style="padding:8px;text-align:right;">Старая цена (сайт/дром)</th>
                 <th style="padding:8px;text-align:right;">Новая цена (сайт/дром)</th>
             </tr></thead>
-            <tbody>{rows}</tbody>
+            <tbody>{pc_rows}</tbody>
         </table>"""
 
     html = f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8"></head>
 <body style="font-family:Arial,sans-serif;background:#fafafa;padding:20px;">
-<div style="max-width:950px;margin:0 auto;background:#fff;padding:30px;border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,0.1);">
+<div style="max-width:1100px;margin:0 auto;background:#fff;padding:30px;border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,0.1);">
     <h2 style="color:#333;border-bottom:2px solid #4472C4;padding-bottom:10px;">
-        📊 Анику — Единый отчет (Дром + сайт)
+        📊 Анику — Единый каталог (без дублей)
     </h2>
-    <p style="color:#666;">Дата: <strong>{date_str}</strong> | Сопоставление по артикулам</p>
+    <p style="color:#666;">Дата: <strong>{date_str}</strong> | Каждый артикул в одном экземпляре</p>
     {cards}
-    {only_site_section}
-    {only_drom_section}
-    {merged_section}
+    {full_table}
     {price_change_section}
     <hr style="margin:30px 0;border:none;border-top:1px solid #eee;">
     <p style="color:#999;font-size:11px;text-align:center;">
