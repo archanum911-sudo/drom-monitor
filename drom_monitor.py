@@ -12,14 +12,16 @@ import json
 import os
 import smtplib
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from typing import List, Dict, Tuple, Set, Optional
 
 # ============ КОНФИГУРАЦИЯ ============
-BASE_DROM = "https://baza.drom.ru/user/aniku123/disk"
-SITE_URL = "https://aniku.ru/catalog/diski"
+# НОВЫЙ URL Дрома — профиль Anikuya (замена aniku123)
+BASE_DROM = "https://vladivostok.baza.drom.ru/user/Anikuya/wheel/disc/"
+# НОВЫЙ URL сайта — fulllist (замена catalog/diski)
+SITE_URL = "https://aniku.ru/fulllist"
 
 EMAIL_FROM = os.getenv("EMAIL_FROM", "")
 EMAIL_PASS = os.getenv("EMAIL_PASS", "")
@@ -28,14 +30,14 @@ EMAIL_TO = os.getenv("EMAIL_TO", "palkinns@mail.ru")
 SNAPSHOT_FILE = "snapshot.json"
 
 HEADERS_DROM = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.0",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
     "Accept-Language": "ru-RU,ru;q=0.9",
     "Referer": "https://baza.drom.ru/",
 }
 
 HEADERS_SITE = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.0",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "ru-RU,ru;q=0.9",
 }
@@ -60,7 +62,7 @@ def fetch_all_drom() -> List[Dict]:
 
     # Прогрев — заходим на базовую страницу для получения cookies
     try:
-        session.get(BASE_DROM, timeout=30)
+        session.get("https://baza.drom.ru/", timeout=30)
         time.sleep(1)
     except Exception as e:
         print(f"[WARN] Прогрев не удался: {e}")
@@ -79,6 +81,12 @@ def fetch_all_drom() -> List[Dict]:
             resp = session.get(BASE_DROM, params=params, timeout=30)
             resp.raise_for_status()
             soup = BeautifulSoup(resp.text, "lxml")
+            
+            # Проверяем не капча ли
+            if "робот" in resp.text.lower() or "капч" in resp.text.lower():
+                print(f"[ERROR] Дром выдал капчу на стр. {page}")
+                break
+            
             items = parse_drom_page(soup)
             if not items:
                 print(f"[Дром] Стр. {page} — пусто, остановка")
@@ -157,6 +165,12 @@ def fetch_site() -> List[Dict]:
             resp = requests.get(url, headers=HEADERS_SITE, timeout=30)
             resp.raise_for_status()
             soup = BeautifulSoup(resp.text, "lxml")
+            
+            # Проверяем не капча ли
+            if "робот" in resp.text.lower() or "капч" in resp.text.lower():
+                print(f"[ERROR] Сайт выдал капчу на стр. {page}")
+                break
+            
             items = parse_site_page(soup)
             if not items:
                 break
@@ -166,7 +180,6 @@ def fetch_site() -> List[Dict]:
             # Проверяем наличие следующей страницы
             next_link = soup.select_one("a.next, a[rel='next']")
             if not next_link:
-                # Проверим через пагинацию
                 pagination = soup.select(".pagination a, .paging a")
                 has_next = any(("page=" + str(page + 1)) in (a.get("href") or "") for a in pagination)
                 if not has_next:
@@ -181,61 +194,54 @@ def fetch_site() -> List[Dict]:
 def parse_site_page(soup: BeautifulSoup) -> List[Dict]:
     """Парсит одну страницу каталога aniku.ru"""
     items = []
-    products = soup.select("li.product, div.product, .product-item")
+    
+    # Новая структура aniku.ru/fulllist
+    products = soup.select("div.product-item, li.product, .product")
+    
+    # Fallback: ищем по ссылкам с id (структура fulllist)
+    if not products:
+        products = soup.select("a[href*='fulllist?id=']")
+    
     for prod in products:
         try:
+            # Вариант 1: стандартная структура
             name_el = prod.select_one(".product-name a, h3 a, a.name, .product-title a")
-            name = name_el.get_text(strip=True) if name_el else "Без названия"
-            name_href = name_el.get("href", "") if name_el else ""
-
-            price_el = prod.select_one(".price, .product-price, .current-price, span[data-price]")
-            price_raw = price_el.get_text(strip=True) if price_el else "0"
-            price = int(re.sub(r'[^\d]', '', price_raw)) if re.sub(r'[^\d]', '', price_raw) else 0
-
+            if not name_el:
+                # Вариант 2: ссылка сама по себе (fulllist)
+                name_el = prod if prod.name == 'a' else None
+            
+            if not name_el:
+                continue
+                
+            name = name_el.get_text(strip=True) if hasattr(name_el, 'get_text') else name_el.get('title', '')
+            if not name:
+                continue
+            
+            # Извлекаем цену
+            price = 0
+            price_container = prod.select_one(".price, .product-price, .current-price")
+            if price_container:
+                price_raw = price_container.get_text(strip=True)
+                price = int(re.sub(r'[^\d]', '', price_raw)) if re.sub(r'[^\d]', '', price_raw) else 0
+            
             # Количество
             qty = 1
-            qty_el = prod.select_one(".stock, .available, .quantity, .in-stock")
-            if qty_el:
-                qm = re.search(r'(\d+)', qty_el.get_text(strip=True))
-                if qm:
-                    qty = int(qm.group(1))
-
+            
             article = extract_article(name)
-
+            href = name_el.get("href", "") if hasattr(name_el, 'get') else ""
+            
             items.append({
                 "name": name,
                 "price": price,
                 "quantity": qty,
                 "article": article,
                 "source": "Урал Кастомс (сайт)",
-                "url": name_href if name_href.startswith("http") else f"https://aniku.ru{name_href}" if name_href else "",
+                "url": href if href.startswith("http") else f"https://aniku.ru{href}" if href else "",
             })
         except Exception as e:
             print(f"[WARN] Ошибка парсинга товара сайта: {e}")
             continue
-
-    # Fallback — если CSS-селекторы не сработали, пробуем более общий
-    if not items:
-        for prod in soup.select("li"):
-            a = prod.select_one("a[href*='/products/']")
-            if not a:
-                continue
-            try:
-                name = a.get_text(strip=True)
-                price_el = prod.select_one(".price")
-                price_raw = price_el.get_text(strip=True) if price_el else "0"
-                price = int(re.sub(r'[^\d]', '', price_raw)) if re.sub(r'[^\d]', '', price_raw) else 0
-                article = extract_article(name)
-                items.append({
-                    "name": name,
-                    "price": price,
-                    "quantity": 1,
-                    "article": article,
-                    "source": "Урал Кастомс (сайт)",
-                })
-            except Exception:
-                continue
-
+    
     return items
 
 # ============ ОБЪЕДИНЕНИЕ И СРАВНЕНИЕ ============
@@ -290,8 +296,14 @@ def compare_with_previous(current_items: List[Dict]) -> List[str]:
         print(f"[WARN] Не удалось загрузить предыдущий снапшот: {e}")
         return alerts
 
-    # Защита от старого формата (list вместо dict)
+    # Защита от старого формата (list или неправильная структура)
     if isinstance(previous, list):
+        print("[WARN] Старый формат снапшота (list), пропускаем сравнение")
+        return alerts
+    
+    # Проверяем что значения — dict
+    if not all(isinstance(v, dict) for v in previous.values()):
+        print("[WARN] Некорректный формат снапшота, пропускаем сравнение")
         return alerts
 
     current_dict = {item["article"]: item for item in current_items if item.get("article")}
@@ -306,7 +318,8 @@ def compare_with_previous(current_items: List[Dict]) -> List[str]:
                 direction = "↑" if curr_price > prev_price else "↓"
                 alerts.append(f'{direction} {art}: {prev_price:,} → {curr_price:,} ₽ ({curr.get("name", "")[:40]})')
         else:
-            alerts.append(f'❌ Исчез: {art} ({prev_data.get("name", "")[:40]})')
+            name = prev_data.get("name", "") if isinstance(prev_data, dict) else ""
+            alerts.append(f'❌ Исчез: {art} ({name[:40]})')
 
     for art, curr in current_dict.items():
         if art not in previous:
@@ -358,7 +371,6 @@ def build_html_report(merged: Dict, only_site: Dict, only_drom: Dict, alerts: Li
     if alerts:
         html += '<div class="alert-box"><b>⚡ Изменения с прошлого раза:</b><br>' + "<br>".join(alerts[:30]) + "</div>"
 
-    # Единая таблица
     html += """
 <h2>📋 Единая таблица позиций</h2>
 <table>
@@ -377,7 +389,6 @@ def build_html_report(merged: Dict, only_site: Dict, only_drom: Dict, alerts: Li
 """
 
     row_num = 0
-    # 🟢 Оба
     for art in sorted(merged.keys()):
         data = merged[art]
         d = data["drom"]
@@ -398,7 +409,6 @@ def build_html_report(merged: Dict, only_site: Dict, only_drom: Dict, alerts: Li
 <td><span class="badge badge-both">🟢 Оба</span></td>
 </tr>"""
 
-    # 🟡 Только сайт
     for art in sorted(only_site.keys()):
         item = only_site[art]
         row_num += 1
@@ -414,7 +424,6 @@ def build_html_report(merged: Dict, only_site: Dict, only_drom: Dict, alerts: Li
 <td><span class="badge badge-site">🟡 Только сайт</span></td>
 </tr>"""
 
-    # 🔴 Только Дром
     for art in sorted(only_drom.keys()):
         item = only_drom[art]
         row_num += 1
