@@ -5,6 +5,9 @@ on:
     - cron: '0 7 * * *'
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   monitor:
     runs-on: ubuntu-latest
@@ -25,7 +28,9 @@ jobs:
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
           
       - name: Save snapshot
-        uses: stefanzweifel/git-auto-commit-action@v5
-        with:
-          commit_message: "Update snapshot [auto]"
-          file_pattern: "snapshot.json"
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          git add snapshot.json
+          git diff --cached --quiet || git commit -m "Update snapshot [auto]"
+          git push
