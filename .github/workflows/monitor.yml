@@ -1,36 +1,118 @@
-name: Drom Monitor
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Мониторинг остатков дисков "Анику" на Дроме и aniku.ru
+Отчёт: единая таблица без дублей по артикулам
+"""
 
-on:
-  schedule:
-    - cron: '0 7 * * *'
-  workflow_dispatch:
+import requests
+from bs4 import BeautifulSoup
+import re
+import json
+import os
+import sys
+import smtplib
+import time
+import argparse
+from datetime import datetime
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from typing import List, Dict, Tuple, Optional
 
-permissions:
-  contents: write
+# ============ КОНФИГУРАЦИЯ ============
+BASE_DROM = "https://vladivostok.baza.drom.ru/user/Anikuya/wheel/disc/"
+SITE_URL = "https://aniku.ru/fulllist"
 
-jobs:
-  monitor:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-          
-      - name: Install dependencies
-        run: pip install -r requirements.txt
-        
-      - name: Run monitor
-        run: python drom_monitor.py --email palkinns@mail.ru
-        env:
-          SMTP_USER: ${{ secrets.SMTP_USER }}
-          SMTP_PASS: ${{ secrets.SMTP_PASS }}
-          
-      - name: Save snapshot
-        run: |
-          git config user.name "github-actions"
-          git config user.email "github-actions@github.com"
-          git add snapshot.json
-          git diff --cached --quiet || git commit -m "Update snapshot [auto]"
-          git push
+SNAPSHOT_FILE = "snapshot.json"
+
+# Поддерживаем оба формата секретов: SMTP_USER/SMTP_PASS и EMAIL_FROM/EMAIL_PASS
+EMAIL_FROM = os.getenv("SMTP_USER") or os.getenv("EMAIL_FROM") or ""
+EMAIL_PASS = os.getenv("SMTP_PASS") or os.getenv("EMAIL_PASS") or ""
+
+# Парсим аргумент --email или берём из env EMAIL_TO
+parser = argparse.ArgumentParser()
+parser.add_argument("--email", default=os.getenv("EMAIL_TO", "palkinns@mail.ru"))
+args, _ = parser.parse_known_args()
+EMAIL_TO = args.email
+
+HEADERS_DROM = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+    "Accept-Language": "ru-RU,ru;q=0.9",
+    "Referer": "https://baza.drom.ru/",
+}
+
+HEADERS_SITE = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "ru-RU,ru;q=0.9",
+}
+
+# ============ ИЗВЛЕЧЕНИЕ АРТИКУЛА ============
+ARTICLE_RE = re.compile(r'\(([A-Z]{1,5}\d{2,}[A-Z0-9\-]*)\)')
+
+def extract_article(name: str) -> Optional[str]:
+    """Извлекает артикул из скобок, например '(S023)' → 'S023'"""
+    if not name:
+        return None
+    m = ARTICLE_RE.search(name)
+    return m.group(1) if m else None
+
+# ============ ПАРСИНГ ДРОМА ============
+def fetch_all_drom() -> List[Dict]:
+    """Парсит все страницы Дрома с фильтрами inSetQuantity=1,2,4,5"""
+    all_items = []
+    seen = set()
+    session = requests.Session()
+    session.headers.update(HEADERS_DROM)
+
+    try:
+        session.get("https://baza.drom.ru/", timeout=30)
+        time.sleep(1)
+    except Exception as e:
+        print(f"[WARN] Прогрев не удался: {e}")
+
+    for page in range(1, 25):
+        params = [
+            ("condition[]", "new"),
+            ("goodPresentState[]", "present"),
+            ("inSetQuantity[]", "1"),
+            ("inSetQuantity[]", "2"),
+            ("inSetQuantity[]", "4"),
+            ("inSetQuantity[]", "5"),
+            ("page", str(page)),
+        ]
+        try:
+            resp = session.get(BASE_DROM, params=params, timeout=30)
+            resp.raise_for_status()
+            soup = BeautifulSoup(resp.text, "lxml")
+            
+            if "робот" in resp.text.lower() or "капч" in resp.text.lower():
+                print(f"[ERROR] Дром выдал капчу на стр. {page}")
+                break
+            
+            items = parse_drom_page(soup)
+            if not items:
+                print(f"[Дром] Стр. {page} — пусто, остановка")
+                break
+
+            new_on_page = 0
+            for item in items:
+                key = (item.get("article"), item.get("price"))
+                if key not in seen:
+                    seen.add(key)
+                    all_items.append(item)
+                    new_on_page += 1
+            print(f"[Дром] Стр. {page}: +{new_on_page} новых (всего {len(all_items)})")
+
+            if new_on_page == 0:
+                break
+            time.sleep(1.5)
+        except Exception as e:
+            print(f"[ERROR] Дром стр. {page}: {e}")
+            break
+
+    return all_items
+
+def parse_drom_page(soup: BeautifulSoup) -> List[Dict]:
+    """Парсит одну страницу результатов Дром
