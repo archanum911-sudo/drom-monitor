@@ -93,7 +93,9 @@ def fetch_drom_page(page_num: int) -> Optional[str]:
     params = {
         "condition%5B%5D": "new",
         "goodPresentState%5B%5D": "present",
-        "inSetQuantity%5B%5D": "4",
+        "inSetQuantity%5B%5D": ["1", "2", "4", "5"],
+        "center": "131.95554587876572,43.13602108559458",
+        "zoom": "16",
         "page": page_num
     }
     try:
