@@ -22,7 +22,7 @@ jobs:
         run: pip install -r requirements.txt
         
       - name: Run monitor
-        run: python drom_monitor.py --email palkinns@mail.ru
+        run: python drom_monitor_v2.py --email palkinns@mail.ru
         env:
           SMTP_USER: ${{ secrets.SMTP_USER }}
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
