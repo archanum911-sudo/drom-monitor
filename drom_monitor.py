@@ -1,670 +1,545 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Анику — Единый мониторинг (Дром + сайт aniku.ru)
-
-Парсит оба источника, сопоставляет по артикулам, формирует единый отчет.
-Каждый артикул в одном экземпляре, без дублей.
+Мониторинг остатков дисков "Анику" на Дроме и aniku.ru
+Отчёт: единая таблица без дублей по артикулам
 """
-
-import argparse
-import json
-import os
-import re
-import smtplib
-import sys
-from collections import Counter, defaultdict
-from datetime import datetime
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple
 
 import requests
 from bs4 import BeautifulSoup
+import re
+import json
+import os
+import smtplib
+import time
+from datetime import datetime, timedelta
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from typing import List, Dict, Tuple, Set, Optional
 
-# ==================== ИСТОЧНИКИ ====================
+# ============ КОНФИГУРАЦИЯ ============
+BASE_DROM = "https://baza.drom.ru/user/aniku123/disk"
+SITE_URL = "https://aniku.ru/catalog/diski"
 
-SOURCE_DROM = "Дром (Анику)"
-SOURCE_SITE = "aniku.ru"
+EMAIL_FROM = os.getenv("EMAIL_FROM", "")
+EMAIL_PASS = os.getenv("EMAIL_PASS", "")
+EMAIL_TO = os.getenv("EMAIL_TO", "palkinns@mail.ru")
+
+SNAPSHOT_FILE = "snapshot.json"
 
 HEADERS_DROM = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.0",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+    "Accept-Language": "ru-RU,ru;q=0.9",
+    "Referer": "https://baza.drom.ru/",
+}
+
+HEADERS_SITE = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.0",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "ru-RU,ru;q=0.9",
 }
-HEADERS_SITE = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-    "Accept": "text/html",
-}
 
-BASE_DROM = "https://baza.drom.ru/user/Aniku/wheel/disc/"
-BASE_SITE = "https://aniku.ru/fulllist"
+# ============ ИЗВЛЕЧЕНИЕ АРТИКУЛА ============
+ARTICLE_RE = re.compile(r'\(([A-Z]{1,5}\d{2,}[A-Z0-9\-]*)\)')
 
-SNAPSHOT_FILE = Path(__file__).parent / "snapshot.json"
-
-
-# ==================== ИЗВЛЕЧЕНИЕ АРТИКУЛА ====================
-
-def extract_article(title: str) -> Optional[str]:
-    """Извлекает артикул из названия товара. Примеры: (S023), (B103), (FG007-FG008)."""
-    if not title:
+def extract_article(name: str) -> Optional[str]:
+    """Извлекает артикул из скобок, например '(S023)' → 'S023'"""
+    if not name:
         return None
-    patterns = [
-        r'\(([A-Z]{1,5}\d{2,}[A-Z]?)\)',
-        r'\(([A-Z]{1,5}\d{2,}-[A-Z]{1,5}\d{2,})\)',
-        r'\(([A-Z]\d{2,}[A-Z]?)\)',
-    ]
-    for pat in patterns:
-        m = re.search(pat, title)
-        if m:
-            return m.group(1)
-    return None
+    m = ARTICLE_RE.search(name)
+    return m.group(1) if m else None
 
-
-def extract_brand(title: str) -> str:
-    title = title.upper()
-    brands = [
-        ("BMW", "BMW"), ("HRE", "HRE"), ("VOSSEN", "Vossen"), ("RAYS", "RAYS"),
-        ("TE37", "RAYS"), ("CE28", "RAYS"), ("VOLK", "RAYS"), ("57X", "RAYS"),
-        ("BBS", "BBS"), ("ADVAN", "Advan"), ("SSR", "SSR"), ("WORK", "Work"),
-        ("SHOGUN", "Shogun"), ("WALD", "Wald"), ("XXR", "XXR"), ("ENKEI", "Enkei"),
-        ("RGW", "RGW"), ("FBX", "FBX"), ("MLJ", "MLJ"), ("KAHH", "Kahn"),
-        ("KAHN", "Kahn"), ("MANSORY", "Mansory"), ("NISMO", "Nismo"),
-        ("ADV.1", "ADV.1"), ("PROCAST", "Procast"), ("PRODRIVE", "ProDrive"),
-        ("MHT", "MHT"), ("BUDDY", "Buddy Club"), ("OASIS", "Oasis"),
-        ("PLATIN", "Platin"), ("TUFF", "Tuff A.T."), ("VORSTEINER", "Vorsteiner"),
-        ("WEDS", "Weds"), ("ROTA", "Rota"), ("OZ", "OZ"), ("DUB", "DUB"),
-        ("INFINITY", "Infinity"), ("BLACK RHINO", "Black Rhino"), ("PDW", "PDW"),
-        ("VPS", "VPS"), ("NIVA", "NIVA"), ("STYLE", "Style"),
-        ("TAW", "TAW"), ("KOSEI", "Kosei"), ("YOKOHAMA", "Yokohama"),
-        ("AVID", "Avid"), ("CONCEPT", "Concept"), ("SHOWY", "Showy"),
-        ("COSMIS", "Cosmis"), ("GFS", "GFS"),
-    ]
-    for keyword, brand_name in brands:
-        if keyword in title:
-            return brand_name
-    return "Other"
-
-
-# ==================== ПАРСИНГ ДРОМА ====================
-
-def fetch_drom_page(page_num: int) -> Optional[str]:
-    params = {
-        "condition%5B%5D": "new",
-        "goodPresentState%5B%5D": "present",
-        "inSetQuantity%5B%5D": ["1", "2", "4", "5"],
-        "center": "131.95554587876572,43.13602108559458",
-        "zoom": "16",
-        "page": page_num
-    }
-    try:
-        resp = requests.get(BASE_DROM, params=params, headers=HEADERS_DROM, timeout=30)
-        resp.encoding = "cp1251"
-        if resp.status_code == 200:
-            return resp.text
-    except Exception:
-        pass
-    return None
-
-
-def parse_drom_listings(html: str) -> List[Dict]:
-    soup = BeautifulSoup(html, "html.parser")
-    items = soup.find_all("div", class_=lambda x: x and "bull-item_inline" in x)
-    listings = []
-    for item in items:
-        try:
-            img = item.find("img", class_="bull-image-preloader")
-            title = img["alt"].replace(" фото", "") if img else None
-            price_elem = item.find("div", {"data-role": "price"})
-            price = None
-            if price_elem:
-                pt = price_elem.get_text(strip=True)
-                pc = re.sub(r"[^\d]", "", pt)
-                price = int(pc) if pc else None
-            link_elem = item.find("a", class_="bull-item__self-link")
-            link_title = link_elem.get_text(strip=True) if link_elem else None
-            link_href = link_elem["href"] if link_elem else None
-            specs_elem = item.find("div", class_="bull-item__annotation-row")
-            specs = specs_elem.get_text(strip=True) if specs_elem else None
-            diam = None
-            if specs:
-                m = re.search(r'(\d+)x(\d+)"', specs)
-                if m:
-                    diam = int(m.group(2))
-                else:
-                    m = re.search(r'R(\d+)', title or "")
-                    if m:
-                        diam = int(m.group(1))
-            brand = extract_brand(title or link_title or "")
-            lid = link_href.split("-")[-1].replace(".html", "") if link_href else None
-            article = extract_article(title or link_title or "")
-            if title and price and lid:
-                listings.append({
-                    "id": lid,
-                    "title": title or link_title,
-                    "price": price,
-                    "specs": specs,
-                    "diameter": diam,
-                    "brand": brand,
-                    "article": article,
-                    "href": f"https://baza.drom.ru{link_href}" if link_href and not link_href.startswith("http") else link_href,
-                })
-        except Exception:
-            continue
-    return listings
-
-
+# ============ ПАРСИНГ ДРОМА ============
 def fetch_all_drom() -> List[Dict]:
+    """Парсит все страницы Дрома с фильтрами inSetQuantity=1,2,4,5"""
     all_items = []
     seen = set()
-    print(f"[INFO] Загружаем {SOURCE_DROM}...")
-    for page in range(1, 18):
-        html = fetch_drom_page(page)
-        if not html:
-            continue
-        items = parse_drom_listings(html)
-        for it in items:
-            if it["id"] not in seen:
-                seen.add(it["id"])
-                all_items.append(it)
-        print(f"  Стр. {page}: {len(items)} (всего: {len(all_items)})")
-        if len(items) < 10:
-            break
-    print(f"[OK] {SOURCE_DROM}: {len(all_items)} позиций, {sum(1 for x in all_items if x['article'])} с артикулом")
-    return all_items
+    session = requests.Session()
+    session.headers.update(HEADERS_DROM)
 
-
-# ==================== ПАРСИНГ aniku.ru ====================
-
-def fetch_site_page(page_num: int) -> Optional[str]:
+    # Прогрев — заходим на базовую страницу для получения cookies
     try:
-        resp = requests.get(BASE_SITE, params={"page": page_num}, headers=HEADERS_SITE, timeout=30)
-        resp.encoding = "utf-8"
-        if resp.status_code == 200:
-            return resp.text
-    except Exception:
-        pass
-    return None
+        session.get(BASE_DROM, timeout=30)
+        time.sleep(1)
+    except Exception as e:
+        print(f"[WARN] Прогрев не удался: {e}")
 
-
-def parse_site_products(html: str) -> List[Dict]:
-    soup = BeautifulSoup(html, "html.parser")
-    products = []
-    for li in soup.find_all("li", class_="product"):
+    for page in range(1, 25):
+        params = [
+            ("condition[]", "new"),
+            ("goodPresentState[]", "present"),
+            ("inSetQuantity[]", "1"),
+            ("inSetQuantity[]", "2"),
+            ("inSetQuantity[]", "4"),
+            ("inSetQuantity[]", "5"),
+            ("page", str(page)),
+        ]
         try:
-            link = li.find("a", href=re.compile(r"fulllist\?id="))
-            if not link:
-                continue
-            href = link.get("href", "")
-            id_match = re.search(r"id=(\d+)", href)
-            product_id = id_match.group(1) if id_match else None
-            title = link.get_text(strip=True)
-            title = re.sub(r'\s*во\s+Владивостоке\s*$', '', title, flags=re.IGNORECASE)
-            price_tag = li.find("h2", style=re.compile(r"color:blue", re.I))
-            price = None
-            if price_tag:
-                price_text = price_tag.get_text(strip=True)
-                price = int(re.sub(r"[^\d]", "", price_text))
-            text = li.get_text(separator=" ", strip=True)
-            w_match = re.search(r'Ширина:\s*([\d.]+)"', text)
-            width = float(w_match.group(1)) if w_match else None
-            diam_match = re.search(r'Ширина:\s*[\d.]+"x(\d+)', text)
-            diameter = int(diam_match.group(1)) if diam_match else None
-            pcd_match = re.search(r'PCD:\s*([\dx/]+)', text)
-            pcd = pcd_match.group(1) if pcd_match else None
-            et_match = re.search(r'ET:\s*(\d+)', text)
-            et = int(et_match.group(1)) if et_match else None
-            cb_match = re.search(r'ЦО:\s*([\d,]+)', text)
-            cb = cb_match.group(1).replace(",", ".") if cb_match else None
-            brand = extract_brand(title)
-            article = extract_article(title)
-            if product_id and title and price:
-                products.append({
-                    "id": f"site_{product_id}",
-                    "title": title,
-                    "price": price,
-                    "diameter": diameter,
-                    "width": width,
-                    "pcd": pcd,
-                    "et": et,
-                    "cb": cb,
-                    "brand": brand,
-                    "article": article,
-                    "href": f"https://aniku.ru{href}" if href.startswith("/") else href,
-                })
-        except Exception:
-            continue
-    return products
+            resp = session.get(BASE_DROM, params=params, timeout=30)
+            resp.raise_for_status()
+            soup = BeautifulSoup(resp.text, "lxml")
+            items = parse_drom_page(soup)
+            if not items:
+                print(f"[Дром] Стр. {page} — пусто, остановка")
+                break
 
+            new_on_page = 0
+            for item in items:
+                key = (item.get("article"), item.get("price"))
+                if key not in seen:
+                    seen.add(key)
+                    all_items.append(item)
+                    new_on_page += 1
+            print(f"[Дром] Стр. {page}: +{new_on_page} новых (всего {len(all_items)})")
 
-def fetch_all_site() -> List[Dict]:
-    import time
-    all_items = []
-    seen = set()
-    print(f"[INFO] Загружаем {SOURCE_SITE}...")
-    for page in range(0, 47):
-        html = fetch_site_page(page)
-        if not html:
-            continue
-        items = parse_site_products(html)
-        for it in items:
-            if it["id"] not in seen:
-                seen.add(it["id"])
-                all_items.append(it)
-        print(f"  Стр. {page}: {len(items)} (всего: {len(all_items)})")
-        if not items:
+            if new_on_page == 0:
+                break
+            time.sleep(1.5)
+        except Exception as e:
+            print(f"[ERROR] Дром стр. {page}: {e}")
             break
-        time.sleep(0.2)
-    print(f"[OK] {SOURCE_SITE}: {len(all_items)} позиций, {sum(1 for x in all_items if x['article'])} с артикулом")
+
     return all_items
 
+def parse_drom_page(soup: BeautifulSoup) -> List[Dict]:
+    """Парсит одну страницу результатов Дрома"""
+    items = []
+    rows = soup.select("div.bull-item-content")
+    for row in rows:
+        try:
+            name_el = row.select_one("a[data-ftid='bulls-list_bull'] .bull-title span")
+            name = name_el.get_text(strip=True) if name_el else "Без названия"
 
-# ==================== ОБЪЕДИНЕНИЕ ПО АРТИКУЛАМ ====================
+            price_el = row.select_one("span[data-ftid='bull_price']")
+            price_raw = price_el.get_text(strip=True) if price_el else "0"
+            price = int(re.sub(r'[^\d]', '', price_raw)) if re.sub(r'[^\d]', '', price_raw) else 0
 
+            loc_el = row.select_one(".bull-item__field__location")
+            location = loc_el.get_text(strip=True) if loc_el else ""
+
+            # Попытка найти количество
+            qty = 1
+            qty_patterns = [
+                row.select_one(".bull-item__field__setQuantity"),
+                row.select_one(".bull-item__field__quantity"),
+            ]
+            for qp in qty_patterns:
+                if qp:
+                    txt = qp.get_text(strip=True)
+                    qm = re.search(r'(\d+)', txt)
+                    if qm:
+                        qty = int(qm.group(1))
+                        break
+
+            article = extract_article(name)
+            items.append({
+                "name": name,
+                "price": price,
+                "location": location,
+                "quantity": qty,
+                "article": article,
+                "source": "Анику (Дром)",
+            })
+        except Exception as e:
+            print(f"[WARN] Ошибка парсинга строки Дром: {e}")
+            continue
+    return items
+
+# ============ ПАРСИНГ ANIKU.RU ============
+def fetch_site() -> List[Dict]:
+    """Парсит aniku.ru — все страницы каталога дисков"""
+    all_items = []
+    page = 1
+    while True:
+        try:
+            url = f"{SITE_URL}?page={page}" if page > 1 else SITE_URL
+            resp = requests.get(url, headers=HEADERS_SITE, timeout=30)
+            resp.raise_for_status()
+            soup = BeautifulSoup(resp.text, "lxml")
+            items = parse_site_page(soup)
+            if not items:
+                break
+            all_items.extend(items)
+            print(f"[Сайт] Стр. {page}: +{len(items)} (всего {len(all_items)})")
+
+            # Проверяем наличие следующей страницы
+            next_link = soup.select_one("a.next, a[rel='next']")
+            if not next_link:
+                # Проверим через пагинацию
+                pagination = soup.select(".pagination a, .paging a")
+                has_next = any(("page=" + str(page + 1)) in (a.get("href") or "") for a in pagination)
+                if not has_next:
+                    break
+            page += 1
+            time.sleep(1)
+        except Exception as e:
+            print(f"[ERROR] Сайт стр. {page}: {e}")
+            break
+    return all_items
+
+def parse_site_page(soup: BeautifulSoup) -> List[Dict]:
+    """Парсит одну страницу каталога aniku.ru"""
+    items = []
+    products = soup.select("li.product, div.product, .product-item")
+    for prod in products:
+        try:
+            name_el = prod.select_one(".product-name a, h3 a, a.name, .product-title a")
+            name = name_el.get_text(strip=True) if name_el else "Без названия"
+            name_href = name_el.get("href", "") if name_el else ""
+
+            price_el = prod.select_one(".price, .product-price, .current-price, span[data-price]")
+            price_raw = price_el.get_text(strip=True) if price_el else "0"
+            price = int(re.sub(r'[^\d]', '', price_raw)) if re.sub(r'[^\d]', '', price_raw) else 0
+
+            # Количество
+            qty = 1
+            qty_el = prod.select_one(".stock, .available, .quantity, .in-stock")
+            if qty_el:
+                qm = re.search(r'(\d+)', qty_el.get_text(strip=True))
+                if qm:
+                    qty = int(qm.group(1))
+
+            article = extract_article(name)
+
+            items.append({
+                "name": name,
+                "price": price,
+                "quantity": qty,
+                "article": article,
+                "source": "Урал Кастомс (сайт)",
+                "url": name_href if name_href.startswith("http") else f"https://aniku.ru{name_href}" if name_href else "",
+            })
+        except Exception as e:
+            print(f"[WARN] Ошибка парсинга товара сайта: {e}")
+            continue
+
+    # Fallback — если CSS-селекторы не сработали, пробуем более общий
+    if not items:
+        for prod in soup.select("li"):
+            a = prod.select_one("a[href*='/products/']")
+            if not a:
+                continue
+            try:
+                name = a.get_text(strip=True)
+                price_el = prod.select_one(".price")
+                price_raw = price_el.get_text(strip=True) if price_el else "0"
+                price = int(re.sub(r'[^\d]', '', price_raw)) if re.sub(r'[^\d]', '', price_raw) else 0
+                article = extract_article(name)
+                items.append({
+                    "name": name,
+                    "price": price,
+                    "quantity": 1,
+                    "article": article,
+                    "source": "Урал Кастомс (сайт)",
+                })
+            except Exception:
+                continue
+
+    return items
+
+# ============ ОБЪЕДИНЕНИЕ И СРАВНЕНИЕ ============
 def merge_by_article(drom_items: List[Dict], site_items: List[Dict]) -> Tuple[Dict, Dict, Dict]:
-    drom_by_art = {}
-    for it in drom_items:
-        art = it.get("article")
-        if art:
-            drom_by_art[art] = it
+    """
+    Объединяет по артикулу. Возвращает:
+    - merged: артикул → {drom, site}
+    - only_site: артикул → site_item
+    - only_drom: артикул → drom_item
+    """
+    drom_by_art: Dict[str, Dict] = {}
+    site_by_art: Dict[str, Dict] = {}
 
-    site_by_art = {}
-    for it in site_items:
-        art = it.get("article")
+    for item in drom_items:
+        art = item.get("article")
         if art:
-            site_by_art[art] = it
+            drom_by_art[art] = item
 
-    all_articles = set(drom_by_art.keys()) | set(site_by_art.keys())
+    for item in site_items:
+        art = item.get("article")
+        if art:
+            site_by_art[art] = item
 
     merged = {}
     only_site = {}
     only_drom = {}
 
-    for art in all_articles:
-        d = drom_by_art.get(art)
-        s = site_by_art.get(art)
+    for art in set(drom_by_art.keys()) & set(site_by_art.keys()):
+        merged[art] = {
+            "drom": drom_by_art[art],
+            "site": site_by_art[art],
+        }
 
-        if d and s:
-            merged[art] = {
-                "article": art,
-                "brand": d.get("brand") or s.get("brand"),
-                "diameter": d.get("diameter") or s.get("diameter"),
-                "title_drom": d["title"],
-                "title_site": s["title"],
-                "price_drom": d["price"],
-                "price_site": s["price"],
-                "href_drom": d["href"],
-                "href_site": s["href"],
-            }
-        elif s and not d:
-            only_site[art] = s
-        elif d and not s:
-            only_drom[art] = d
+    for art in set(site_by_art.keys()) - set(drom_by_art.keys()):
+        only_site[art] = site_by_art[art]
+
+    for art in set(drom_by_art.keys()) - set(site_by_art.keys()):
+        only_drom[art] = drom_by_art[art]
 
     return merged, only_site, only_drom
 
+def compare_with_previous(current_items: List[Dict]) -> List[str]:
+    """Сравнивает с предыдущим снапшотом, возвращает список изменений"""
+    alerts = []
+    if not os.path.exists(SNAPSHOT_FILE):
+        return alerts
 
-# ==================== СНАПШОТ ====================
-
-def load_snapshot() -> Optional[Dict]:
-    if SNAPSHOT_FILE.exists():
-        with open(SNAPSHOT_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return None
-
-
-def save_snapshot(data: Dict):
     try:
-        with open(SNAPSHOT_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        print(f"[INFO] Снапшот сохранен: {SNAPSHOT_FILE}")
-    except TypeError as e:
-        print(f"[ERROR] Ошибка сериализации JSON: {e}")
-        clean_data = {
-            "drom_total": data.get("drom_total", 0),
-            "site_total": data.get("site_total", 0),
-            "timestamp": data.get("timestamp", datetime.now().isoformat()),
-            "merged_count": len(data.get("merged", {})),
-            "only_site_count": len(data.get("only_site", {})),
-            "only_drom_count": len(data.get("only_drom", {})),
-        }
-        with open(SNAPSHOT_FILE, "w", encoding="utf-8") as f:
-            json.dump(clean_data, f, ensure_ascii=False, indent=2)
-        print(f"[WARN] Сохранена упрощенная версия снапшота")
+        with open(SNAPSHOT_FILE, "r", encoding="utf-8") as f:
+            previous = json.load(f)
+    except Exception as e:
+        print(f"[WARN] Не удалось загрузить предыдущий снапшот: {e}")
+        return alerts
 
+    # Защита от старого формата (list вместо dict)
+    if isinstance(previous, list):
+        return alerts
 
-def compare_with_previous(current: Dict, previous) -> Dict:
-    """Сравнивает текущее состояние с предыдущим. Возвращает статистику изменений."""
-    stats = {
-        "drom_total": current.get("drom_total", 0),
-        "site_total": current.get("site_total", 0),
-        "merged": len(current.get("merged", {})),
-        "only_site": len(current.get("only_site", {})),
-        "only_drom": len(current.get("only_drom", {})),
-    }
+    current_dict = {item["article"]: item for item in current_items if item.get("article")}
 
-    # Если previous — старый формат (list) или None — пропускаем сравнение
-    if not previous or isinstance(previous, list):
-        if isinstance(previous, list):
-            print("[WARN] Обнаружен старый формат снапшота (list). Сравнение пропущено.")
-        return stats
+    # Проверяем изменения цен и наличия
+    for art, prev_data in previous.items():
+        if art in current_dict:
+            curr = current_dict[art]
+            prev_price = prev_data.get("price", 0)
+            curr_price = curr.get("price", 0)
+            if prev_price and curr_price and abs(prev_price - curr_price) > max(prev_price * 0.05, 100):
+                direction = "↑" if curr_price > prev_price else "↓"
+                alerts.append(f'{direction} {art}: {prev_price:,} → {curr_price:,} ₽ ({curr.get("name", "")[:40]})')
+        else:
+            alerts.append(f'❌ Исчез: {art} ({prev_data.get("name", "")[:40]})')
 
-    prev_merged = previous.get("merged", {})
-    curr_merged = current.get("merged", {})
-    price_changes = []
-    for art, data in curr_merged.items():
-        if art in prev_merged:
-            old = prev_merged[art]
-            if old.get("price_site") != data.get("price_site") or old.get("price_drom") != data.get("price_drom"):
-                price_changes.append({
-                    "article": art,
-                    "brand": data["brand"],
-                    "title": data["title_site"][:50],
-                    "old_site": old.get("price_site"),
-                    "new_site": data.get("price_site"),
-                    "old_drom": old.get("price_drom"),
-                    "new_drom": data.get("price_drom"),
-                })
+    for art, curr in current_dict.items():
+        if art not in previous:
+            alerts.append(f'🆕 Новый: {art} — {curr.get("price", 0):,} ₽ ({curr.get("name", "")[:40]})')
 
-    prev_only_site = set(previous.get("only_site", {}).keys())
-    curr_only_site = set(current.get("only_site", {}).keys())
-    new_site_items = [current["only_site"][art] for art in (curr_only_site - prev_only_site)]
+    return alerts
 
-    prev_only_drom = set(previous.get("only_drom", {}).keys())
-    curr_only_drom = set(current.get("only_drom", {}).keys())
-    new_drom_items = [current["only_drom"][art] for art in (curr_only_drom - prev_only_drom)]
-
-    stats["price_changes"] = price_changes
-    stats["new_site_items"] = new_site_items
-    stats["new_drom_items"] = new_drom_items
-    stats["prev_merged_count"] = len(prev_merged)
-    stats["price_change_count"] = len(price_changes)
-
-    return stats
-
-
-# ==================== ОТЧЕТ (единая таблица без дублей) ====================
-
-def build_html_report(current: Dict, stats: Dict) -> str:
-    date_str = datetime.now().strftime("%d.%m.%Y %H:%M")
-    merged = current.get("merged", {})
-    only_site = current.get("only_site", {})
-    only_drom = current.get("only_drom", {})
-
-    # Собираем все артикулы в единый список (без дублей)
-    all_items = []
-
-    # 1. Дубли — одна строка
-    for art, data in merged.items():
-        all_items.append({
-            "article": art,
-            "brand": data["brand"],
-            "diameter": data.get("diameter"),
-            "title": data["title_site"],
-            "price_site": data["price_site"],
-            "price_drom": data["price_drom"],
-            "href_site": data["href_site"],
-            "href_drom": data["href_drom"],
-            "status": "Оба",
-            "status_icon": "🟢",
-            "status_color": "#2e7d32",
-        })
-
-    # 2. Только на сайте
-    for art, item in only_site.items():
-        all_items.append({
-            "article": art,
-            "brand": item["brand"],
-            "diameter": item.get("diameter"),
-            "title": item["title"],
-            "price_site": item["price"],
-            "price_drom": None,
-            "href_site": item["href"],
-            "href_drom": None,
-            "status": "Только сайт",
-            "status_icon": "🟡",
-            "status_color": "#ed6c00",
-        })
-
-    # 3. Только на Дроме
-    for art, item in only_drom.items():
-        all_items.append({
-            "article": art,
-            "brand": item["brand"],
-            "diameter": item.get("diameter"),
-            "title": item["title"],
-            "price_site": None,
-            "price_drom": item["price"],
-            "href_site": None,
-            "href_drom": item["href"],
-            "status": "Только Дром",
-            "status_icon": "🔴",
-            "status_color": "#c62828",
-        })
-
-    # Сортируем: Только сайт → Оба → Только Дром, затем по цене
-    status_order = {"Только сайт": 0, "Оба": 1, "Только Дром": 2}
-    all_items.sort(key=lambda x: (status_order[x["status"]], -(x["price_site"] or x["price_drom"] or 0)))
-
-    # Карточки статистики
-    cards = f"""
-    <div style="display:flex;gap:10px;margin:20px 0;flex-wrap:wrap;">
-        <div style="background:#e3f2fd;padding:14px;border-radius:6px;text-align:center;min-width:90px;">
-            <div style="font-size:20px;font-weight:bold;color:#1565c0;">{stats['drom_total']}</div>
-            <div style="font-size:11px;color:#666;">{SOURCE_DROM}</div>
-        </div>
-        <div style="background:#e8f5e9;padding:14px;border-radius:6px;text-align:center;min-width:90px;">
-            <div style="font-size:20px;font-weight:bold;color:#2e7d32;">{stats['site_total']}</div>
-            <div style="font-size:11px;color:#666;">{SOURCE_SITE}</div>
-        </div>
-        <div style="background:#f3e5f5;padding:14px;border-radius:6px;text-align:center;min-width:90px;">
-            <div style="font-size:20px;font-weight:bold;color:#6a1b9a;">{len(all_items)}</div>
-            <div style="font-size:11px;color:#666;">Уникальных арт.</div>
-        </div>
-        <div style="background:#e0f2f1;padding:14px;border-radius:6px;text-align:center;min-width:90px;">
-            <div style="font-size:20px;font-weight:bold;color:#00695c;">{stats['merged']}</div>
-            <div style="font-size:11px;color:#666;">🟢 Оба</div>
-        </div>
-        <div style="background:#fff3e0;padding:14px;border-radius:6px;text-align:center;min-width:90px;">
-            <div style="font-size:20px;font-weight:bold;color:#ed6c00;">{stats['only_site']}</div>
-            <div style="font-size:11px;color:#666;">🟡 Только сайт</div>
-        </div>
-        <div style="background:#ffebee;padding:14px;border-radius:6px;text-align:center;min-width:90px;">
-            <div style="font-size:20px;font-weight:bold;color:#c62828;">{stats['only_drom']}</div>
-            <div style="font-size:11px;color:#666;">🔴 Только Дром</div>
-        </div>
-    </div>"""
-
-    # Единая таблица всех артикулов
-    rows = ""
-    for item in all_items:
-        ps = f"{item['price_site']:,.0f} ₽" if item['price_site'] else "—"
-        pd = f"{item['price_drom']:,.0f} ₽" if item['price_drom'] else "—"
-        d = f"R{item['diameter']}" if item['diameter'] else "—"
-        title_link = item['title'][:50]
-        if item['href_site']:
-            title_link = f'<a href="{item["href_site"]}">{title_link}</a>'
-        elif item['href_drom']:
-            title_link = f'<a href="{item["href_drom"]}">{title_link}</a>'
-
-        bg = {"Только сайт": "#fff8e1", "Оба": "", "Только Дром": "#ffebee"}[item["status"]]
-
-        rows += f"""
-        <tr style="background:{bg};">
-            <td style="padding:8px;border-bottom:1px solid #eee;font-family:monospace;font-size:12px;font-weight:bold;">{item['article']}</td>
-            <td style="padding:8px;border-bottom:1px solid #eee;text-align:center;font-size:16px;">{item['status_icon']}</td>
-            <td style="padding:8px;border-bottom:1px solid #eee;color:{item['status_color']};font-size:11px;font-weight:bold;">{item['status']}</td>
-            <td style="padding:8px;border-bottom:1px solid #eee;">{item['brand']}</td>
-            <td style="padding:8px;border-bottom:1px solid #eee;">{title_link}</td>
-            <td style="padding:8px;border-bottom:1px solid #eee;text-align:center;">{d}</td>
-            <td style="padding:8px;border-bottom:1px solid #eee;text-align:right;">{ps}</td>
-            <td style="padding:8px;border-bottom:1px solid #eee;text-align:right;">{pd}</td>
-        </tr>"""
-
-    full_table = f"""
-    <h3 style="color:#333;margin-top:25px;">📋 Полный каталог артикулов Анику ({len(all_items)} шт.)</h3>
-    <p style="color:#666;font-size:12px;margin-bottom:10px;">
-        🟢 Оба источника | 🟡 Только aniku.ru (стоит выложить на Дром) | 🔴 Только Дром (проверить)
-    </p>
-    <div style="overflow-x:auto;">
-    <table style="width:100%;border-collapse:collapse;font-size:12px;min-width:800px;">
-        <thead><tr style="background:#f5f5f5;">
-            <th style="padding:10px;text-align:left;width:70px;">Арт.</th>
-            <th style="padding:10px;text-align:center;width:30px;"></th>
-            <th style="padding:10px;text-align:left;width:90px;">Статус</th>
-            <th style="padding:10px;text-align:left;">Бренд</th>
-            <th style="padding:10px;text-align:left;">Название</th>
-            <th style="padding:10px;text-align:center;">R</th>
-            <th style="padding:10px;text-align:right;">aniku.ru</th>
-            <th style="padding:10px;text-align:right;">Дром</th>
-        </tr></thead>
-        <tbody>{rows}</tbody>
-    </table>
-    </div>"""
-
-    # Блок: Изменения цен
-    price_change_section = ""
-    price_changes = stats.get("price_changes", [])
-    if price_changes:
-        pc_rows = ""
-        for pc in price_changes[:15]:
-            pc_rows += f"""
-            <tr>
-                <td style="padding:8px;border-bottom:1px solid #eee;font-family:monospace;font-size:12px;">{pc['article']}</td>
-                <td style="padding:8px;border-bottom:1px solid #eee;">{pc['brand']}</td>
-                <td style="padding:8px;border-bottom:1px solid #eee;">{pc['title'][:45]}</td>
-                <td style="padding:8px;border-bottom:1px solid #eee;text-align:right;text-decoration:line-through;color:#999;">{pc['old_site']:,.0f} / {pc['old_drom']:,.0f}</td>
-                <td style="padding:8px;border-bottom:1px solid #eee;text-align:right;font-weight:bold;">{pc['new_site']:,.0f} / {pc['new_drom']:,.0f}</td>
-            </tr>"""
-        price_change_section = f"""
-        <h3 style="color:#ef6c00;margin-top:25px;">💰 Изменения цен с прошлого запуска ({len(price_changes)})</h3>
-        <table style="width:100%;border-collapse:collapse;font-size:12px;">
-            <thead><tr style="background:#f5f5f5;">
-                <th style="padding:8px;text-align:left;width:70px;">Арт.</th>
-                <th style="padding:8px;text-align:left;">Бренд</th>
-                <th style="padding:8px;text-align:left;">Название</th>
-                <th style="padding:8px;text-align:right;">Старая цена (сайт/дром)</th>
-                <th style="padding:8px;text-align:right;">Новая цена (сайт/дром)</th>
-            </tr></thead>
-            <tbody>{pc_rows}</tbody>
-        </table>"""
+# ============ ФОРМИРОВАНИЕ ОТЧЁТА ============
+def build_html_report(merged: Dict, only_site: Dict, only_drom: Dict, alerts: List[str]) -> str:
+    """Формирует единый HTML-отчёт без дублей"""
+    now = datetime.now().strftime("%d.%m.%Y %H:%M")
+    total = len(merged) + len(only_site) + len(only_drom)
 
     html = f"""<!DOCTYPE html>
-<html><head><meta charset="utf-8"></head>
-<body style="font-family:Arial,sans-serif;background:#fafafa;padding:20px;">
-<div style="max-width:1100px;margin:0 auto;background:#fff;padding:30px;border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,0.1);">
-    <h2 style="color:#333;border-bottom:2px solid #4472C4;padding-bottom:10px;">
-        📊 Анику — Единый каталог (без дублей)
-    </h2>
-    <p style="color:#666;">Дата: <strong>{date_str}</strong> | Каждый артикул в одном экземпляре</p>
-    {cards}
-    {full_table}
-    {price_change_section}
-    <hr style="margin:30px 0;border:none;border-top:1px solid #eee;">
-    <p style="color:#999;font-size:11px;text-align:center;">
-        Анику Monitor | {SOURCE_DROM} + {SOURCE_SITE} |
-        <a href="https://aniku.ru/fulllist">aniku.ru</a> |
-        <a href="https://baza.drom.ru/user/Aniku/wheel/disc/">Дром</a>
-    </p>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<title>Отчёт Анику — {now}</title>
+<style>
+    body {{ font-family: Arial, sans-serif; margin: 20px; color: #333; }}
+    h1 {{ font-size: 20px; margin-bottom: 5px; }}
+    h2 {{ font-size: 16px; margin-top: 20px; margin-bottom: 10px; }}
+    .summary {{ background: #f5f5f5; padding: 12px; border-radius: 6px; margin-bottom: 20px; }}
+    table {{ border-collapse: collapse; width: 100%; font-size: 13px; }}
+    th, td {{ border: 1px solid #ddd; padding: 8px; text-align: left; }}
+    th {{ background: #4a4a4a; color: white; position: sticky; top: 0; }}
+    tr:nth-child(even) {{ background: #fafafa; }}
+    .both {{ background: #e8f5e9 !important; }}
+    .site-only {{ background: #fff9c4 !important; }}
+    .drom-only {{ background: #ffebee !important; }}
+    .price {{ font-weight: bold; color: #2e7d32; white-space: nowrap; }}
+    .article {{ font-family: monospace; font-weight: bold; color: #1565c0; }}
+    .alert-box {{ background: #fff3e0; border-left: 4px solid #ff9800; padding: 10px; margin-bottom: 20px; }}
+    .footer {{ margin-top: 20px; font-size: 11px; color: #999; }}
+    .badge {{ display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: bold; }}
+    .badge-both {{ background: #4caf50; color: white; }}
+    .badge-site {{ background: #ff9800; color: white; }}
+    .badge-drom {{ background: #f44336; color: white; }}
+</style>
+</head>
+<body>
+<h1>📊 Отчёт по остаткам — {now}</h1>
+<div class="summary">
+    <b>Всего уникальных артикулов:</b> {total}<br>
+    🟢 Оба источника: {len(merged)} | 🟡 Только сайт: {len(only_site)} | 🔴 Только Дром: {len(only_drom)}
+</div>
+"""
+
+    if alerts:
+        html += '<div class="alert-box"><b>⚡ Изменения с прошлого раза:</b><br>' + "<br>".join(alerts[:30]) + "</div>"
+
+    # Единая таблица
+    html += """
+<h2>📋 Единая таблица позиций</h2>
+<table>
+<thead>
+<tr>
+    <th>#</th>
+    <th>Артикул</th>
+    <th>Название</th>
+    <th>Цена Дром</th>
+    <th>Цена Сайт</th>
+    <th>Наличие</th>
+    <th>Статус</th>
+</tr>
+</thead>
+<tbody>
+"""
+
+    row_num = 0
+    # 🟢 Оба
+    for art in sorted(merged.keys()):
+        data = merged[art]
+        d = data["drom"]
+        s = data["site"]
+        row_num += 1
+        d_price = f"{d.get('price', 0):,} ₽" if d.get('price') else "—"
+        s_price = f"{s.get('price', 0):,} ₽" if s.get('price') else "—"
+        d_qty = d.get('quantity', 1)
+        s_qty = s.get('quantity', 1)
+        qty_str = f"Дром: {d_qty} / Сайт: {s_qty}"
+        html += f"""<tr class="both">
+<td>{row_num}</td>
+<td class="article">{art}</td>
+<td>{d.get('name', s.get('name', ''))}</td>
+<td class="price">{d_price}</td>
+<td class="price">{s_price}</td>
+<td>{qty_str}</td>
+<td><span class="badge badge-both">🟢 Оба</span></td>
+</tr>"""
+
+    # 🟡 Только сайт
+    for art in sorted(only_site.keys()):
+        item = only_site[art]
+        row_num += 1
+        s_price = f"{item.get('price', 0):,} ₽" if item.get('price') else "—"
+        s_qty = item.get('quantity', 1)
+        html += f"""<tr class="site-only">
+<td>{row_num}</td>
+<td class="article">{art}</td>
+<td>{item.get('name', '')}</td>
+<td>—</td>
+<td class="price">{s_price}</td>
+<td>Сайт: {s_qty}</td>
+<td><span class="badge badge-site">🟡 Только сайт</span></td>
+</tr>"""
+
+    # 🔴 Только Дром
+    for art in sorted(only_drom.keys()):
+        item = only_drom[art]
+        row_num += 1
+        d_price = f"{item.get('price', 0):,} ₽" if item.get('price') else "—"
+        d_qty = item.get('quantity', 1)
+        html += f"""<tr class="drom-only">
+<td>{row_num}</td>
+<td class="article">{art}</td>
+<td>{item.get('name', '')}</td>
+<td class="price">{d_price}</td>
+<td>—</td>
+<td>Дром: {d_qty}</td>
+<td><span class="badge badge-drom">🔴 Только Дром</span></td>
+</tr>"""
+
+    html += f"""</tbody></table>
+<div class="footer">
+Сформировано: {now}<br>
+Источники: Дром (Анику) + aniku.ru (Урал Кастомс)
 </div>
 </body></html>"""
     return html
 
+def save_snapshot(items: List[Dict]):
+    """Сохраняет снапшот текущих данных для сравнения в будущем"""
+    snap = {}
+    for item in items:
+        art = item.get("article")
+        if art:
+            snap[art] = {
+                "name": item.get("name", ""),
+                "price": item.get("price", 0),
+                "quantity": item.get("quantity", 1),
+            }
+    with open(SNAPSHOT_FILE, "w", encoding="utf-8") as f:
+        json.dump(snap, f, ensure_ascii=False, indent=2)
+    print(f"[OK] Снапшот сохранён: {len(snap)} артикулов")
 
-def send_email(to_email: str, html: str, smtp_user: str, smtp_pass: str,
-               smtp_host: str = "smtp.mail.ru", smtp_port: int = 465) -> bool:
-    if not smtp_user or not smtp_pass:
-        print("[ERROR] Не указаны SMTP-логин и пароль")
+# ============ ОТПРАВКА EMAIL ============
+def send_email(subject: str, html_body: str) -> bool:
+    """Отправляет HTML-письмо через SMTP Mail.ru"""
+    if not EMAIL_FROM or not EMAIL_PASS:
+        print("[SKIP] Email не настроен (отсутствуют EMAIL_FROM / EMAIL_PASS)")
         return False
-    subject = f"📊 Анику — отчет за {datetime.now().strftime('%d.%m.%Y')}"
-    msg = MIMEMultipart("alternative")
-    msg["Subject"] = subject
-    msg["From"] = smtp_user
-    msg["To"] = to_email
-    msg.attach(MIMEText(html, "html", "utf-8"))
+
     try:
-        server = smtplib.SMTP_SSL(smtp_host, smtp_port)
-        server.login(smtp_user, smtp_pass)
-        server.sendmail(smtp_user, to_email, msg.as_string())
-        server.quit()
-        print(f"[SUCCESS] Отчет отправлен на {to_email}")
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = subject
+        msg["From"] = EMAIL_FROM
+        msg["To"] = EMAIL_TO
+
+        msg.attach(MIMEText(html_body, "html", "utf-8"))
+
+        with smtplib.SMTP_SSL("smtp.mail.ru", 465) as server:
+            server.login(EMAIL_FROM, EMAIL_PASS)
+            server.sendmail(EMAIL_FROM, [EMAIL_TO], msg.as_string())
+        print(f"[OK] Письмо отправлено на {EMAIL_TO}")
         return True
     except Exception as e:
-        print(f"[ERROR] Ошибка отправки: {e}")
+        print(f"[ERROR] Ошибка отправки email: {e}")
         return False
 
-
-# ==================== ОСНОВНАЯ ЛОГИКА ====================
-
+# ============ ГЛАВНЫЙ ПРОЦЕСС ============
 def main():
-    parser = argparse.ArgumentParser(description="Анику — Единый мониторинг")
-    parser.add_argument("--email", required=True)
-    parser.add_argument("--smtp-host", default="smtp.mail.ru")
-    parser.add_argument("--smtp-port", type=int, default=465)
-    parser.add_argument("--smtp-user", default=os.environ.get("SMTP_USER"))
-    parser.add_argument("--smtp-pass", default=os.environ.get("SMTP_PASS"))
-    parser.add_argument("--no-email", action="store_true")
-    parser.add_argument("--force", action="store_true")
-    args = parser.parse_args()
+    print(f"\n{'='*50}")
+    print(f"🚀 Запуск мониторинга — {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}")
+    print(f"{'='*50}\n")
 
-    print(f"{'='*60}")
-    print(f"АНИКУ — Единый мониторинг (Дром + aniku.ru)")
-    print(f"{'='*60}")
-
+    # 1. Парсим Дром
+    print("[1/4] Парсинг Дрома...")
     drom_items = fetch_all_drom()
-    site_items = fetch_all_site()
+    print(f"✅ Дром: {len(drom_items)} позиций")
 
+    # 2. Парсим сайт
+    print("\n[2/4] Парсинг aniku.ru...")
+    site_items = fetch_site()
+    print(f"✅ Сайт: {len(site_items)} позиций")
+
+    # 3. Объединяем по артикулам
+    print("\n[3/4] Объединение по артикулам...")
     merged, only_site, only_drom = merge_by_article(drom_items, site_items)
 
-    print(f"\n{'='*60}")
-    print(f"СОПОСТАВЛЕНИЕ ПО АРТИКУЛАМ")
-    print(f"{'='*60}")
-    print(f"  Дубли (оба):          {len(merged)}")
-    print(f"  Только aniku.ru:      {len(only_site)}")
-    print(f"  Только Дром:          {len(only_drom)}")
+    # Собираем единый список для снапшота и сравнения
+    unified_items = []
+    for art, data in merged.items():
+        unified_items.append({
+            "article": art,
+            "name": data["drom"].get("name", data["site"].get("name", "")),
+            "price": data["drom"].get("price") or data["site"].get("price", 0),
+            "quantity": (data["drom"].get("quantity", 0) + data["site"].get("quantity", 0)),
+        })
+    for art, item in only_site.items():
+        unified_items.append({
+            "article": art,
+            "name": item.get("name", ""),
+            "price": item.get("price", 0),
+            "quantity": item.get("quantity", 1),
+        })
+    for art, item in only_drom.items():
+        unified_items.append({
+            "article": art,
+            "name": item.get("name", ""),
+            "price": item.get("price", 0),
+            "quantity": item.get("quantity", 1),
+        })
 
-    current_state = {
-        "drom_total": len(drom_items),
-        "site_total": len(site_items),
-        "merged": merged,
-        "only_site": {k: {**v, "href": v["href"]} for k, v in only_site.items()},
-        "only_drom": {k: {**v, "href": v["href"]} for k, v in only_drom.items()},
-        "timestamp": datetime.now().isoformat(),
-    }
+    # 4. Сравнение с предыдущим запуском
+    alerts = compare_with_previous(unified_items)
 
-    previous = load_snapshot()
-    stats = compare_with_previous(current_state, previous)
+    # 5. Формируем отчёт
+    print("\n[4/4] Формирование отчёта...")
+    html_report = build_html_report(merged, only_site, only_drom, alerts)
 
-    print(f"\n  Изменений цен:        {stats.get('price_change_count', 0)}")
-    print(f"  Новых на сайте:       {len(stats.get('new_site_items', []))}")
-    print(f"  Новых на Дроме:       {len(stats.get('new_drom_items', []))}")
+    # 6. Отправляем email
+    now_str = datetime.now().strftime("%d.%m.%Y")
+    subject = f"📊 Анику — остатки {now_str} | Уникальных: {len(unified_items)}"
+    send_email(subject, html_report)
 
-    save_snapshot(current_state)
+    # 7. Сохраняем снапшот
+    save_snapshot(unified_items)
 
-    has_changes = (
-        len(only_site) > 0 or len(only_drom) > 0 or
-        stats.get("price_change_count", 0) > 0 or
-        len(stats.get("new_site_items", [])) > 0 or
-        len(stats.get("new_drom_items", [])) > 0
-    )
-
-    if has_changes or args.force:
-        html = build_html_report(current_state, stats)
-        if not args.no_email:
-            send_email(
-                to_email=args.email,
-                html=html,
-                smtp_user=args.smtp_user,
-                smtp_pass=args.smtp_pass,
-                smtp_host=args.smtp_host,
-                smtp_port=args.smtp_port
-            )
-        else:
-            print("[--no-email] Email не отправлен")
-    else:
-        print("[INFO] Изменений не обнаружено — отчет не отправлен (используйте --force)")
-
+    print(f"\n{'='*50}")
+    print(f"✅ Готово! Уникальных артикулов: {len(unified_items)}")
+    print(f"   🟢 Оба: {len(merged)} | 🟡 Только сайт: {len(only_site)} | 🔴 Только Дром: {len(only_drom)}")
+    print(f"{'='*50}\n")
 
 if __name__ == "__main__":
     main()
